@@ -11,7 +11,11 @@ env:
   IOS_DEPLOYMENT_TARGET: "17.0"
   MINGW: llvm-mingw-20260421-ucrt-macos-universal
   # bump to invalidate every cache at once
-  CACHE_V: "1"
+  CACHE_V: "2"
+  HOMEBREW_NO_AUTO_UPDATE: "1"
+  HOMEBREW_NO_INSTALL_CLEANUP: "1"
+  # Optional prebuilt LLVM 15 iOS pruned release archive URL for instant setup
+  LLVM_PREBUILT_URL: ""
 
 jobs:
   build:
@@ -23,6 +27,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
+          fetch-depth: 1
 
       - name: Select Xcode
         run: |
@@ -187,12 +192,23 @@ jobs:
         run: |
           set -euxo pipefail
           export PATH="$PWD/toolchains/$MINGW/bin:$PATH"
+          NCPU="$(sysctl -n hw.ncpu)"
           cd wine
           mkdir -p build-macos && cd build-macos
           ../configure --enable-win64 --disable-tests --without-x --without-freetype
           test -f include/config.h
-          make -k -j"$(sysctl -n hw.ncpu)" 2>&1 | tail -40 || true
-          echo "=== host-side link failures are expected; PE side is what matters ==="
+
+          echo "=== Fast targeted build: tools/widl, widl headers, and libwinecrt0.a ==="
+          make -j"$NCPU" tools/widl || true
+          make -j"$NCPU" include/dwrite.h include/dwrite_1.h include/dwrite_2.h include/dwrite_3.h || true
+          make -j"$NCPU" dlls/winecrt0/aarch64-windows/libwinecrt0.a || true
+
+          # If any target wasn't satisfied by the direct targets, run make -k as fallback
+          if [ ! -f dlls/winecrt0/aarch64-windows/libwinecrt0.a ] || [ ! -f include/dwrite.h ]; then
+            echo "Direct targets incomplete; running scoped make -k pass..."
+            make -k -j"$NCPU" 2>&1 | tail -40 || true
+          fi
+          echo "=== Wine essential outputs generated ==="
 
       - name: Verify Wine outputs + wire up build-arm64ec
         run: |
@@ -461,11 +477,26 @@ jobs:
             toolchains/llvm-ios-build
             toolchains/llvm-host
           key: llvm-1507-ios-pruned-${{ env.CACHE_V }}
+          restore-keys: |
+            llvm-1507-ios-pruned-
 
       - name: LLVM 15.0.7 for iOS
         if: steps.llvm.outputs.cache-hit != 'true'
         run: |
           set -euxo pipefail
+          mkdir -p toolchains
+          # If a prebuilt release asset URL is provided, download directly (~15-30s instead of ~18 min build)
+          if [ -n "${LLVM_PREBUILT_URL:-}" ]; then
+            echo "Attempting to fetch prebuilt LLVM from $LLVM_PREBUILT_URL..."
+            if curl -fL "$LLVM_PREBUILT_URL" | tar -xJ -C toolchains/; then
+              echo "Prebuilt LLVM extracted successfully."
+              ls toolchains/llvm-ios-build/lib/*.a | head
+              exit 0
+            else
+              echo "Download failed; falling back to source compilation."
+            fi
+          fi
+
           git clone --depth 1 --branch llvmorg-15.0.7 \
             https://github.com/llvm/llvm-project toolchains/llvm-project
           sed -i '' 's/MATCHES "Darwin"/MATCHES "Darwin|iOS"/' \
@@ -505,6 +536,13 @@ jobs:
           find toolchains/llvm-project/llvm -mindepth 1 -maxdepth 1 \
             ! -name include -exec rm -rf {} +
           du -sh toolchains/llvm-ios-build toolchains/llvm-project
+          # Archive the pruned LLVM build so it can easily be uploaded to GitHub Releases for instant builds
+          mkdir -p artifacts
+          tar -cJf artifacts/llvm-1507-ios-pruned.tar.xz \
+            toolchains/llvm-project/llvm/include \
+            toolchains/llvm-ios-build/include \
+            toolchains/llvm-ios-build/lib
+          echo "Pruned LLVM bundle created at artifacts/llvm-1507-ios-pruned.tar.xz"
 
       # ==============================================================
       # DXMT — PE modules via meson (needs Wine's winecrt0), then the
@@ -663,6 +701,7 @@ jobs:
           name: Madeira
           path: |
             artifacts/Madeira.ipa
+            artifacts/*.tar.xz
             /tmp/fex.log
             wine/build-macos/config.log
             research/dxmt/build-pe/meson-logs/**
